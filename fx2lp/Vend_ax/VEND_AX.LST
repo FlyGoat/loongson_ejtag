@@ -1,0 +1,561 @@
+C51 COMPILER V7.07   VEND_AX                                                               05/17/2014 14:52:03 PAGE 1   
+
+
+C51 COMPILER V7.07, COMPILATION OF MODULE VEND_AX
+OBJECT MODULE PLACED IN VEND_AX.OBJ
+COMPILER INVOKED BY: C:\Keil\C51\BIN\C51.EXE VEND_AX.C OPTIMIZE(6,SPEED) DEFINE(NO_RENUM) DEBUG OBJECTEXTEND
+
+stmt level    source
+
+   1          //-----------------------------------------------------------------------------
+   2          //   File:      bulkloop.c
+   3          //   Contents:  Hooks required to implement USB peripheral function.
+   4          //
+   5          // $Archive: /USB/Examples/Fx2lp/vend_ax/Vend_Ax.c $
+   6          // $Date: 9/02/03 7:32p $
+   7          // $Revision: 1 $
+   8          //
+   9          //
+  10          //-----------------------------------------------------------------------------
+  11          // Copyright 2003, Cypress Semiconductor Corporation
+  12          //-----------------------------------------------------------------------------
+  13          #pragma NOIV                                    // Do not generate interrupt vectors
+  14          
+  15          #include "lp.h"
+  16          #include "lpregs.h"
+  17          
+  18          extern BOOL     GotSUD;                 // Received setup data flag
+  19          extern BOOL     Sleep;
+  20          extern BOOL     Rwuen;
+  21          extern BOOL     Selfpwr;
+  22          
+  23          BYTE    Configuration;          // Current configuration
+  24          BYTE    AlternateSetting;       // Alternate settings
+  25          
+  26          //-----------------------------------------------------------------------------
+  27          // Constants
+  28          //-----------------------------------------------------------------------------
+  29          #define VR_UPLOAD               0xc0
+  30          #define VR_DOWNLOAD             0x40
+  31          #define VR_EEPROM               0xa2 // loads (uploads) small EEPROM
+  32          #define VR_RAM                  0xa3 // loads (uploads) external ram
+  33          #define VR_GET_CHIP_REV 0xa6 // Rev A, B = 0, Rev C = 2 // NOTE: New TNG Rev
+  34          #define VR_RENUM            0xa8 // renum
+  35          #define VR_DB_FX            0xa9 // Force use of double byte address EEPROM (for FX)
+  36          #define VR_I2C_100      0xaa // put the i2c bus in 100Khz mode
+  37          #define VR_I2C_400      0xab // put the i2c bus in 400Khz mode
+  38          
+  39          #define SERIAL_ADDR             0x50
+  40          #define EP0BUFF_SIZE    0x40
+  41          
+  42          #define GET_CHIP_REV()          ((CPUCS >> 4) & 0x00FF) // EzUSB Chip Rev Field
+  43          
+  44          //-----------------------------------------------------------------------------
+  45          // Global Variables
+  46          //-----------------------------------------------------------------------------
+  47          BYTE                    DB_Addr;                                        //TPM Dual Byte Address stat
+  48          BYTE                    I2C_Addr;                                       //TPM I2C address
+  49          
+  50          //-----------------------------------------------------------------------------
+  51          // Prototypes
+  52          //-----------------------------------------------------------------------------
+  53          void EEPROMWrite(WORD addr, BYTE length, BYTE xdata *buf); //TPM EEPROM Write
+  54          void EEPROMRead(WORD addr, BYTE length, BYTE xdata *buf);  //TPM EEPROM Read
+  55          
+C51 COMPILER V7.07   VEND_AX                                                               05/17/2014 14:52:03 PAGE 2   
+
+  56          //-----------------------------------------------------------------------------
+  57          // Task Dispatcher hooks
+  58          //      The following hooks are called by the task dispatcher.
+  59          //-----------------------------------------------------------------------------
+  60          
+  61          void TD_Init(void)                              // Called once at startup
+  62          {
+  63   1              Rwuen = TRUE;                           // Enable remote-wakeup
+  64   1              EZUSB_InitI2C();                        // Initialize I2C Bus
+  65   1      }
+  66          
+  67          void TD_Poll(void)                              // Called repeatedly while the device is idle
+  68          {
+  69   1      }
+  70          
+  71          BOOL TD_Suspend(void)                   // Called before the device goes into suspend mode
+  72          {
+  73   1              return(TRUE);
+  74   1      }
+  75          
+  76          BOOL TD_Resume(void)                    // Called after the device resumes
+  77          {
+  78   1              return(TRUE);
+  79   1      }
+  80          
+  81          //-----------------------------------------------------------------------------
+  82          // Device Request hooks
+  83          //      The following hooks are called by the end point 0 device request parser.
+  84          //-----------------------------------------------------------------------------
+  85          
+  86          
+  87          BOOL DR_GetDescriptor(void)
+  88          {
+  89   1         return(TRUE);
+  90   1      }
+  91          
+  92          BOOL DR_SetConfiguration(void)   // Called when a Set Configuration command is received
+  93          {
+  94   1         Configuration = SETUPDAT[2];
+  95   1         return(TRUE);            // Handled by user code
+  96   1      }
+  97          
+  98          BOOL DR_GetConfiguration(void)   // Called when a Get Configuration command is received
+  99          {
+ 100   1         EP0BUF[0] = Configuration;
+ 101   1         EP0BCH = 0;
+ 102   1         EP0BCL = 1;
+ 103   1         return(TRUE);            // Handled by user code
+ 104   1      }
+ 105          
+ 106          BOOL DR_SetInterface(void)       // Called when a Set Interface command is received
+ 107          {
+ 108   1         AlternateSetting = SETUPDAT[2];
+ 109   1         return(TRUE);            // Handled by user code
+ 110   1      }
+ 111          
+ 112          BOOL DR_GetInterface(void)       // Called when a Set Interface command is received
+ 113          {
+ 114   1         EP0BUF[0] = AlternateSetting;
+ 115   1         EP0BCH = 0;
+ 116   1         EP0BCL = 1;
+ 117   1         return(TRUE);            // Handled by user code
+C51 COMPILER V7.07   VEND_AX                                                               05/17/2014 14:52:03 PAGE 3   
+
+ 118   1      }
+ 119          
+ 120          BOOL DR_GetStatus(void)
+ 121          {
+ 122   1         return(TRUE);
+ 123   1      }
+ 124          
+ 125          BOOL DR_ClearFeature(void)
+ 126          {
+ 127   1         return(TRUE);
+ 128   1      }
+ 129          
+ 130          BOOL DR_SetFeature(void)
+ 131          {
+ 132   1         return(TRUE);
+ 133   1      }
+ 134          
+ 135          BOOL DR_VendorCmnd(void)
+ 136          {
+ 137   1              WORD            addr, len, bc;
+ 138   1              WORD            ChipRev;
+ 139   1              WORD i;
+ 140   1      
+ 141   1              // Determine I2C boot eeprom device address; addr = 0x0 for 8 bit addr eeproms (24LC00)
+ 142   1              I2C_Addr = SERIAL_ADDR | ((I2CS & 0x10) >> 4); // addr=0x01 for 16 bit addr eeprom (LC65)
+ 143   1              // Indicate if it is a dual byte address part
+ 144   1              DB_Addr = (BOOL)(I2C_Addr & 0x01); //TPM: ID1 is 16 bit addr bit - set by rocker sw or jumper
+ 145   1      
+ 146   1              switch(SETUPDAT[1])
+ 147   1              { //TPM handle new commands
+ 148   2      
+ 149   2                      case VR_GET_CHIP_REV:
+ 150   2                                              ChipRev = GET_CHIP_REV();
+ 151   2                                              *EP0BUF = ChipRev;
+ 152   2                                              EP0BCH = 0;
+ 153   2                                              EP0BCL = 1; // Arm endpoint with # bytes to transfer
+ 154   2                                              EP0CS |= bmHSNAK; // Acknowledge handshake phase of device request
+ 155   2                              break;
+ 156   2                      case VR_I2C_100:
+ 157   2                              I2CTL &= ~bm400KHZ;
+ 158   2                              EP0BCH = 0;
+ 159   2                              EP0BCL = 0;
+ 160   2                              break;
+ 161   2                      case VR_I2C_400:
+ 162   2                              I2CTL |= bm400KHZ;
+ 163   2                              EP0BCH = 0;
+ 164   2                              EP0BCL = 0;
+ 165   2                              break;
+ 166   2                      case VR_RENUM:
+ 167   2                                              *EP0BUF = 7;
+ 168   2                                              EP0BCH = 0;
+ 169   2                                              EP0BCL = 1; // Arm endpoint with # bytes to transfer
+ 170   2                                              EP0CS |= bmHSNAK; // Acknowledge handshake phase of device request
+ 171   2                                              EZUSB_Delay(1000);
+ 172   2                                              EZUSB_Discon(TRUE);             // renumerate until setup received
+ 173   2                              break;
+ 174   2                      case VR_DB_FX:
+ 175   2                              DB_Addr = 0x01;         //TPM: need to assert double byte
+ 176   2                              I2C_Addr |= 0x01;       //TPM: need to assert double byte
+ 177   2                      addr = SETUPDAT[2];             // Get address and length
+ 178   2                              addr |= SETUPDAT[3] << 8;
+ 179   2                              len = SETUPDAT[6];
+C51 COMPILER V7.07   VEND_AX                                                               05/17/2014 14:52:03 PAGE 4   
+
+ 180   2                              len |= SETUPDAT[7] << 8;
+ 181   2                              // Is this an upload command ?
+ 182   2                              if(SETUPDAT[0] == VR_UPLOAD)
+ 183   2                              {
+ 184   3                                      while(len)                                      // Move requested data through EP0IN 
+ 185   3                                      {                                                       // one packet at a time.
+ 186   4      
+ 187   4                     while(EP0CS & bmEPBUSY);
+ 188   4      
+ 189   4                                              if(len < EP0BUFF_SIZE)
+ 190   4                                                      bc = len;
+ 191   4                                              else
+ 192   4                                                      bc = EP0BUFF_SIZE;
+ 193   4      
+ 194   4                                              for(i=0; i<bc; i++)
+ 195   4                                                      *(EP0BUF+i) = 0xcd;
+ 196   4                                              EEPROMRead(addr,(WORD)bc,(WORD)EP0BUF);
+ 197   4      
+ 198   4                                              EP0BCH = 0;
+ 199   4                                              EP0BCL = (BYTE)bc; // Arm endpoint with # bytes to transfer
+ 200   4      
+ 201   4                                              addr += bc;
+ 202   4                                              len -= bc;
+ 203   4                                      }
+ 204   3                              }
+ 205   2                              // Is this a download command ?
+ 206   2                              else if(SETUPDAT[0] == VR_DOWNLOAD)
+ 207   2                              {
+ 208   3                                      while(len)                                      // Move new data through EP0OUT 
+ 209   3                                      {                                                       // one packet at a time.
+ 210   4                                              // Arm endpoint - do it here to clear (after sud avail)
+ 211   4                                              EP0BCH = 0;
+ 212   4                                              EP0BCL = 0; // Clear bytecount to allow new data in; also stops NAKing
+ 213   4      
+ 214   4                                              while(EP0CS & bmEPBUSY);
+ 215   4      
+ 216   4                                              bc = EP0BCL; // Get the new bytecount
+ 217   4      
+ 218   4                                              EEPROMWrite(addr,bc,(WORD)EP0BUF);
+ 219   4      
+ 220   4                                              addr += bc;
+ 221   4                                              len -= bc;
+ 222   4                                      }
+ 223   3                              }
+ 224   2                      
+ 225   2                      break;
+ 226   2                      case VR_RAM:
+ 227   2                        // NOTE: This case falls through !    
+ 228   2                      case VR_EEPROM:
+ 229   2                              DB_Addr = 0x00;         //TPM: need to assert double byte
+ 230   2                              I2C_Addr |= 0x00;       //TPM: need to assert double byte
+ 231   2                              addr = SETUPDAT[2];             // Get address and length
+ 232   2                              addr |= SETUPDAT[3] << 8;
+ 233   2                              len = SETUPDAT[6];
+ 234   2                              len |= SETUPDAT[7] << 8;
+ 235   2                              // Is this an upload command ?
+ 236   2                              if(SETUPDAT[0] == VR_UPLOAD)
+ 237   2                              {
+ 238   3                                      while(len)                                      // Move requested data through EP0IN 
+ 239   3                                      {                                                       // one packet at a time.
+ 240   4      
+ 241   4                     while(EP0CS & bmEPBUSY);
+C51 COMPILER V7.07   VEND_AX                                                               05/17/2014 14:52:03 PAGE 5   
+
+ 242   4      
+ 243   4                                              if(len < EP0BUFF_SIZE)
+ 244   4                                                      bc = len;
+ 245   4                                              else
+ 246   4                                                      bc = EP0BUFF_SIZE;
+ 247   4      
+ 248   4                                              // Is this a RAM upload ?
+ 249   4                                              if(SETUPDAT[1] == VR_RAM)
+ 250   4                                              {
+ 251   5                                                      for(i=0; i<bc; i++)
+ 252   5                                                              *(EP0BUF+i) = *((BYTE xdata *)addr+i);
+ 253   5                                              }
+ 254   4                                              else
+ 255   4                                              {
+ 256   5                                                      for(i=0; i<bc; i++)
+ 257   5                                                              *(EP0BUF+i) = 0xcd;
+ 258   5                                                      EEPROMRead(addr,(WORD)bc,(WORD)EP0BUF);
+ 259   5                                              }
+ 260   4      
+ 261   4                                              EP0BCH = 0;
+ 262   4                                              EP0BCL = (BYTE)bc; // Arm endpoint with # bytes to transfer
+ 263   4      
+ 264   4                                              addr += bc;
+ 265   4                                              len -= bc;
+ 266   4      
+ 267   4                                      }
+ 268   3                              }
+ 269   2                              // Is this a download command ?
+ 270   2                              else if(SETUPDAT[0] == VR_DOWNLOAD)
+ 271   2                              {
+ 272   3                                      while(len)                                      // Move new data through EP0OUT 
+ 273   3                                      {                                                       // one packet at a time.
+ 274   4                                              // Arm endpoint - do it here to clear (after sud avail)
+ 275   4                                              EP0BCH = 0;
+ 276   4                                              EP0BCL = 0; // Clear bytecount to allow new data in; also stops NAKing
+ 277   4      
+ 278   4                                              while(EP0CS & bmEPBUSY);
+ 279   4      
+ 280   4                                              bc = EP0BCL; // Get the new bytecount
+ 281   4      
+ 282   4                                              // Is this a RAM download ?
+ 283   4                                              if(SETUPDAT[1] == VR_RAM)
+ 284   4                                              {
+ 285   5                                                      for(i=0; i<bc; i++)
+ 286   5                                                               *((BYTE xdata *)addr+i) = *(EP0BUF+i);
+ 287   5                                              }
+ 288   4                                              else
+ 289   4                                                      EEPROMWrite(addr,bc,(WORD)EP0BUF);
+ 290   4      
+ 291   4                                              addr += bc;
+ 292   4                                              len -= bc;
+ 293   4                                      }
+ 294   3                              }
+ 295   2                              break;
+ 296   2              }
+ 297   1              return(FALSE); // no error; command handled OK
+ 298   1      }
+ 299          
+ 300          //-----------------------------------------------------------------------------
+ 301          // USB Interrupt Handlers
+ 302          //      The following functions are called by the USB interrupt jump table.
+ 303          //-----------------------------------------------------------------------------
+C51 COMPILER V7.07   VEND_AX                                                               05/17/2014 14:52:03 PAGE 6   
+
+ 304          
+ 305          // Setup Data Available Interrupt Handler
+ 306          void ISR_Sudav(void) interrupt 0
+ 307          {
+ 308   1         // enable the automatic length feature of the Setup Data Autopointer
+ 309   1         // in case a previous transfer disbaled it
+ 310   1         SUDPTRCTL |= bmSDPAUTO;
+ 311   1      
+ 312   1         GotSUD = TRUE;            // Set flag
+ 313   1         EZUSB_IRQ_CLEAR();
+ 314   1         USBIRQ = bmSUDAV;         // Clear SUDAV IRQ
+ 315   1      }
+ 316          
+ 317          // Setup Token Interrupt Handler
+ 318          void ISR_Sutok(void) interrupt 0
+ 319          {
+ 320   1         EZUSB_IRQ_CLEAR();
+ 321   1         USBIRQ = bmSUTOK;         // Clear SUTOK IRQ
+ 322   1      }
+ 323          
+ 324          void ISR_Sof(void) interrupt 0
+ 325          {
+ 326   1         EZUSB_IRQ_CLEAR();
+ 327   1         USBIRQ = bmSOF;            // Clear SOF IRQ
+ 328   1      }
+ 329          
+ 330          void ISR_Ures(void) interrupt 0
+ 331          {
+ 332   1         if (EZUSB_HIGHSPEED())
+ 333   1         {
+ 334   2            pConfigDscr = pHighSpeedConfigDscr;
+ 335   2            pOtherConfigDscr = pFullSpeedConfigDscr;
+ 336   2         }
+ 337   1         else
+ 338   1         {
+ 339   2            pConfigDscr = pFullSpeedConfigDscr;
+ 340   2            pOtherConfigDscr = pHighSpeedConfigDscr;
+ 341   2         }
+ 342   1         
+ 343   1         EZUSB_IRQ_CLEAR();
+ 344   1         USBIRQ = bmURES;         // Clear URES IRQ
+ 345   1      }
+ 346          
+ 347          void ISR_Susp(void) interrupt 0
+ 348          {
+ 349   1         Sleep = TRUE;
+ 350   1         EZUSB_IRQ_CLEAR();
+ 351   1         USBIRQ = bmSUSP;
+ 352   1      }
+ 353          
+ 354          void ISR_Highspeed(void) interrupt 0
+ 355          {
+ 356   1         if (EZUSB_HIGHSPEED())
+ 357   1         {
+ 358   2            pConfigDscr = pHighSpeedConfigDscr;
+ 359   2            pOtherConfigDscr = pFullSpeedConfigDscr;
+ 360   2         }
+ 361   1         else
+ 362   1         {
+ 363   2            pConfigDscr = pFullSpeedConfigDscr;
+ 364   2            pOtherConfigDscr = pHighSpeedConfigDscr;
+ 365   2         }
+C51 COMPILER V7.07   VEND_AX                                                               05/17/2014 14:52:03 PAGE 7   
+
+ 366   1      
+ 367   1         EZUSB_IRQ_CLEAR();
+ 368   1         USBIRQ = bmHSGRANT;
+ 369   1      }
+ 370          
+ 371          void ISR_Ep0ack(void) interrupt 0
+ 372          {
+ 373   1      }
+ 374          void ISR_Stub(void) interrupt 0
+ 375          {
+ 376   1      }
+ 377          void ISR_Ep0in(void) interrupt 0
+ 378          {
+ 379   1      }
+ 380          void ISR_Ep0out(void) interrupt 0
+ 381          {
+ 382   1      }
+ 383          void ISR_Ep1in(void) interrupt 0
+ 384          {
+ 385   1      }
+ 386          void ISR_Ep1out(void) interrupt 0
+ 387          {
+ 388   1      }
+ 389          void ISR_Ep2inout(void) interrupt 0
+ 390          {
+ 391   1      }
+ 392          void ISR_Ep4inout(void) interrupt 0
+ 393          {
+ 394   1      }
+ 395          void ISR_Ep6inout(void) interrupt 0
+ 396          {
+ 397   1      }
+ 398          void ISR_Ep8inout(void) interrupt 0
+ 399          {
+ 400   1      }
+ 401          void ISR_Ibn(void) interrupt 0
+ 402          {
+ 403   1      }
+ 404          void ISR_Ep0pingnak(void) interrupt 0
+ 405          {
+ 406   1      }
+ 407          void ISR_Ep1pingnak(void) interrupt 0
+ 408          {
+ 409   1      }
+ 410          void ISR_Ep2pingnak(void) interrupt 0
+ 411          {
+ 412   1      }
+ 413          void ISR_Ep4pingnak(void) interrupt 0
+ 414          {
+ 415   1      }
+ 416          void ISR_Ep6pingnak(void) interrupt 0
+ 417          {
+ 418   1      }
+ 419          void ISR_Ep8pingnak(void) interrupt 0
+ 420          {
+ 421   1      }
+ 422          void ISR_Errorlimit(void) interrupt 0
+ 423          {
+ 424   1      }
+ 425          void ISR_Ep2piderror(void) interrupt 0
+ 426          {
+ 427   1      }
+C51 COMPILER V7.07   VEND_AX                                                               05/17/2014 14:52:03 PAGE 8   
+
+ 428          void ISR_Ep4piderror(void) interrupt 0
+ 429          {
+ 430   1      }
+ 431          void ISR_Ep6piderror(void) interrupt 0
+ 432          {
+ 433   1      }
+ 434          void ISR_Ep8piderror(void) interrupt 0
+ 435          {
+ 436   1      }
+ 437          void ISR_Ep2pflag(void) interrupt 0
+ 438          {
+ 439   1      }
+ 440          void ISR_Ep4pflag(void) interrupt 0
+ 441          {
+ 442   1      }
+ 443          void ISR_Ep6pflag(void) interrupt 0
+ 444          {
+ 445   1      }
+ 446          void ISR_Ep8pflag(void) interrupt 0
+ 447          {
+ 448   1      }
+ 449          void ISR_Ep2eflag(void) interrupt 0
+ 450          {
+ 451   1      }
+ 452          void ISR_Ep4eflag(void) interrupt 0
+ 453          {
+ 454   1      }
+ 455          void ISR_Ep6eflag(void) interrupt 0
+ 456          {
+ 457   1      }
+ 458          void ISR_Ep8eflag(void) interrupt 0
+ 459          {
+ 460   1      }
+ 461          void ISR_Ep2fflag(void) interrupt 0
+ 462          {
+ 463   1      }
+ 464          void ISR_Ep4fflag(void) interrupt 0
+ 465          {
+ 466   1      }
+ 467          void ISR_Ep6fflag(void) interrupt 0
+ 468          {
+ 469   1      }
+ 470          void ISR_Ep8fflag(void) interrupt 0
+ 471          {
+ 472   1      }
+ 473          void ISR_GpifComplete(void) interrupt 0
+ 474          {
+ 475   1      }
+ 476          void ISR_GpifWaveform(void) interrupt 0
+ 477          {
+ 478   1      }
+ 479          
+ 480          void EEPROMWriteByte(WORD addr, BYTE value)
+ 481          {
+ 482   1              BYTE            i = 0;
+ 483   1              BYTE xdata      ee_str[3];
+ 484   1      
+ 485   1              if(DB_Addr)
+ 486   1                      ee_str[i++] = MSB(addr);
+ 487   1      
+ 488   1              ee_str[i++] = LSB(addr);
+ 489   1              ee_str[i++] = value;
+C51 COMPILER V7.07   VEND_AX                                                               05/17/2014 14:52:03 PAGE 9   
+
+ 490   1      
+ 491   1              EZUSB_WriteI2C(I2C_Addr, i, ee_str);
+ 492   1         EZUSB_WaitForEEPROMWrite(I2C_Addr);
+ 493   1      }
+ 494          
+ 495          
+ 496          void EEPROMWrite(WORD addr, BYTE length, BYTE xdata *buf)
+ 497          {
+ 498   1              BYTE    i;
+ 499   1              for(i=0;i<length;++i)
+ 500   1                      EEPROMWriteByte(addr++,buf[i]);
+ 501   1      }
+ 502          
+ 503          void EEPROMRead(WORD addr, BYTE length, BYTE xdata *buf)
+ 504          {
+ 505   1              BYTE            i = 0;
+ 506   1              BYTE            j = 0;
+ 507   1              BYTE xdata      ee_str[2];
+ 508   1      
+ 509   1              if(DB_Addr)
+ 510   1                      ee_str[i++] = MSB(addr);
+ 511   1      
+ 512   1              ee_str[i++] = LSB(addr);
+ 513   1      
+ 514   1              EZUSB_WriteI2C(I2C_Addr, i, ee_str);
+ 515   1      
+ 516   1      //      for(j=0; j < length; j++)
+ 517   1      //              *(buf+j) = 0xcd;
+ 518   1      
+ 519   1              EZUSB_ReadI2C(I2C_Addr, length, buf);
+ 520   1      }
+ 521          
+ 522          
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =   1376    ----
+   CONSTANT SIZE    =   ----    ----
+   XDATA SIZE       =   ----       5
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =      4      20
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =   ----    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)
